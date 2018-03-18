@@ -29,20 +29,16 @@ typedef struct {
 } paaudio;
 
 typedef struct {
-    HWVoiceOut hw;
+    union {
+      HWVoiceOut out; // dir == PA_STREAM_PLAYBACK
+      HWVoiceIn in; // dir == PA_STREAM_RECORD
+    } hw;
     pa_stream *stream;
     paaudio *g;
     pa_sample_spec ss;
     pa_buffer_attr ba;
-} PAVoiceOut;
-
-typedef struct {
-    HWVoiceIn hw;
-    pa_stream *stream;
-    paaudio *g;
-    pa_sample_spec ss;
-    pa_buffer_attr ba;
-} PAVoiceIn;
+    pa_stream_direction_t dir;
+} PAVoice;
 
 static void qpa_audio_fini(void *opaque);
 
@@ -105,9 +101,29 @@ static inline int PA_STREAM_IS_GOOD(pa_stream_state_t x)
         }                                                               \
     } while (0);
 
+
+static pa_stream *qpa_simple_new (PAVoice *pa, const char *name, const char *dev, int *rerror);
+
+static void qpa_stream_reconnect(PAVoice *pa)
+{
+    int error;
+    char* name;
+
+    if (pa->dir == PA_STREAM_RECORD) {
+      name = pa->g->conf.source;
+    } else {
+      name = pa->g->conf.sink;
+    }
+
+    pa->stream = qpa_simple_new(pa, "qemu", name, &error);
+    if (!pa->stream) {
+        qpa_logerr (error, "qpa_stream_reconnect failed\n");
+    }
+}
+
 static int qpa_run_out(HWVoiceOut *hw, int live)
 {
-    PAVoiceOut *pa = (PAVoiceOut *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     int rpos, decr, samples;
     size_t avail_bytes, max_bytes;
     struct st_sample *src;
@@ -156,6 +172,10 @@ static int qpa_run_out(HWVoiceOut *hw, int live)
     return decr;
 
 fail:
+    if (pa_context_get_state(pa->g->context) == PA_CONTEXT_READY && pa_stream_get_state(pa->stream) == PA_STREAM_FAILED) {
+      qpa_logerr(error, "out stream failed, trying to reconnect...\n");
+      qpa_stream_reconnect(pa);
+    }
     qpa_logerr(error, "qpa_run_out failed\n");
     goto bail;
 }
@@ -167,7 +187,7 @@ static int qpa_write (SWVoiceOut *sw, void *buf, int len)
 
 static int qpa_run_in(HWVoiceIn *hw)
 {
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     int wpos, incr;
     char *pa_src;
     int error = 0;
@@ -225,6 +245,10 @@ bail:
     return incr;
 
 fail:
+    if (pa_context_get_state(pa->g->context) == PA_CONTEXT_READY && pa_stream_get_state(pa->stream) == PA_STREAM_FAILED) {
+      qpa_logerr(error, "in stream failed, trying to reconnect...\n");
+      qpa_stream_reconnect(pa);
+    }
     qpa_logerr(error, "qpa_run_in failed\n");
     goto bail;
 }
@@ -282,14 +306,22 @@ static audfmt_e pa_to_audfmt (pa_sample_format_t fmt, int *endianness)
     }
 }
 
+static int qpa_context_connect(paaudio *g);
+
 static void context_state_cb (pa_context *c, void *userdata)
 {
     paaudio *g = userdata;
 
     switch (pa_context_get_state(c)) {
-    case PA_CONTEXT_READY:
     case PA_CONTEXT_TERMINATED:
+    case PA_CONTEXT_READY:
+        pa_threaded_mainloop_signal (g->mainloop, 0);
+        break;
+
     case PA_CONTEXT_FAILED:
+        if (qpa_context_connect(g) != 0) {
+          dolog ("failed to reconnect context\n");
+        }
         pa_threaded_mainloop_signal (g->mainloop, 0);
         break;
 
@@ -303,12 +335,12 @@ static void context_state_cb (pa_context *c, void *userdata)
 
 static void stream_state_cb (pa_stream *s, void * userdata)
 {
-    paaudio *g = userdata;
+    PAVoice *pa = userdata;
+    paaudio *g = pa->g;
 
     switch (pa_stream_get_state (s)) {
-
-    case PA_STREAM_READY:
     case PA_STREAM_FAILED:
+    case PA_STREAM_READY:
     case PA_STREAM_TERMINATED:
         pa_threaded_mainloop_signal (g->mainloop, 0);
         break;
@@ -320,34 +352,31 @@ static void stream_state_cb (pa_stream *s, void * userdata)
 }
 
 static pa_stream *qpa_simple_new (
-        paaudio *g,
+        PAVoice *pa,
         const char *name,
-        pa_stream_direction_t dir,
         const char *dev,
-        const pa_sample_spec *ss,
-        const pa_channel_map *map,
-        const pa_buffer_attr *attr,
         int *rerror)
 {
     int r;
     pa_stream *stream;
+    paaudio* g = pa->g;
 
     pa_threaded_mainloop_lock (g->mainloop);
 
-    stream = pa_stream_new (g->context, name, ss, map);
+    stream = pa_stream_new (g->context, name, &pa->ss, 0);
     if (!stream) {
         goto fail;
     }
 
-    pa_stream_set_state_callback (stream, stream_state_cb, g);
+    pa_stream_set_state_callback (stream, stream_state_cb, pa);
 
-    if (dir == PA_STREAM_PLAYBACK) {
-        r = pa_stream_connect_playback(stream, dev, attr,
+    if (pa->dir == PA_STREAM_PLAYBACK) {
+        r = pa_stream_connect_playback(stream, dev, &pa->ba,
                 PA_STREAM_INTERPOLATE_TIMING
                 | (g->conf.adjust_latency_out ? PA_STREAM_ADJUST_LATENCY : 0)
                 | PA_STREAM_AUTO_TIMING_UPDATE, NULL, NULL);
     } else {
-        r = pa_stream_connect_record(stream, dev, attr,
+        r = pa_stream_connect_record(stream, dev, &pa->ba,
                 PA_STREAM_INTERPOLATE_TIMING
                 | (g->conf.adjust_latency_in ? PA_STREAM_ADJUST_LATENCY : 0)
                 | PA_STREAM_AUTO_TIMING_UPDATE);
@@ -378,8 +407,10 @@ static int qpa_init_out(HWVoiceOut *hw, struct audsettings *as,
 {
     int error;
     struct audsettings obt_as = *as;
-    PAVoiceOut *pa = (PAVoiceOut *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     paaudio *g = pa->g = drv_opaque;
+
+    pa->dir = PA_STREAM_PLAYBACK;
 
     int64_t timer_tick_duration =
         audio_MAX(audio_get_timer_ticks(), 1 * SCALE_MS);
@@ -422,15 +453,12 @@ static int qpa_init_out(HWVoiceOut *hw, struct audsettings *as,
     obt_as.fmt = pa_to_audfmt(pa->ss.format, &obt_as.endianness);
 
     pa->stream = qpa_simple_new(
-            g,
+            pa,
             "qemu",
-            PA_STREAM_PLAYBACK,
             g->conf.sink,
-            &pa->ss,
-            NULL,                   /* channel map */
-            &pa->ba,                /* buffering attributes */
             &error
     );
+
     if (!pa->stream) {
         qpa_logerr (error, "pa_simple_new for playback failed\n");
         goto fail1;
@@ -449,8 +477,10 @@ static int qpa_init_in(HWVoiceIn *hw, struct audsettings *as, void *drv_opaque)
 {
     int error;
     struct audsettings obt_as = *as;
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     paaudio *g = pa->g = drv_opaque;
+
+    pa->dir = PA_STREAM_RECORD;
 
     int64_t timer_tick_duration =
         audio_MAX(audio_get_timer_ticks(), 1 * SCALE_MS);
@@ -497,15 +527,12 @@ static int qpa_init_in(HWVoiceIn *hw, struct audsettings *as, void *drv_opaque)
     obt_as.fmt = pa_to_audfmt(pa->ss.format, &obt_as.endianness);
 
     pa->stream = qpa_simple_new(
-            g,
+            pa,
             "qemu",
-            PA_STREAM_RECORD,
             g->conf.source,
-            &pa->ss,
-            NULL,                   /* channel map */
-            &pa->ba,                /* buffering attributes */
             &error
     );
+
     if (!pa->stream) {
         qpa_logerr (error, "pa_simple_new for capture failed\n");
         goto fail1;
@@ -522,7 +549,7 @@ static int qpa_init_in(HWVoiceIn *hw, struct audsettings *as, void *drv_opaque)
 
 static void qpa_fini_out (HWVoiceOut *hw)
 {
-    PAVoiceOut *pa = (PAVoiceOut *) hw;
+    PAVoice *pa = (PAVoice *) hw;
 
     if (pa->stream) {
         pa_stream_unref (pa->stream);
@@ -532,7 +559,7 @@ static void qpa_fini_out (HWVoiceOut *hw)
 
 static void qpa_fini_in (HWVoiceIn *hw)
 {
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    PAVoice *pa = (PAVoice *) hw;
 
     if (pa->stream) {
         pa_stream_unref (pa->stream);
@@ -542,7 +569,7 @@ static void qpa_fini_in (HWVoiceIn *hw)
 
 static int qpa_ctl_out (HWVoiceOut *hw, int cmd, ...)
 {
-    PAVoiceOut *pa = (PAVoiceOut *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     pa_operation *op;
     pa_cvolume v;
     paaudio *g = pa->g;
@@ -594,7 +621,7 @@ static int qpa_ctl_out (HWVoiceOut *hw, int cmd, ...)
 
 static int qpa_ctl_in (HWVoiceIn *hw, int cmd, ...)
 {
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    PAVoice *pa = (PAVoice *) hw;
     pa_operation *op;
     pa_cvolume v;
     paaudio *g = pa->g;
@@ -651,6 +678,25 @@ static PAConf glob_conf = {
         .adjust_latency_in = 1,
 };
 
+static int qpa_context_connect(paaudio *g)
+{
+    g->context = pa_context_new (pa_threaded_mainloop_get_api (g->mainloop),
+                                 g->conf.server);
+    if (!g->context) {
+        return -1;
+    }
+
+    pa_context_set_state_callback (g->context, context_state_cb, g);
+
+    if (pa_context_connect (g->context, g->conf.server, 0, NULL) < 0) {
+        qpa_logerr (pa_context_errno (g->context),
+                    "pa_context_connect() failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 static void *qpa_audio_init (void)
 {
     paaudio *g = g_malloc(sizeof(paaudio));
@@ -663,18 +709,8 @@ static void *qpa_audio_init (void)
         goto fail;
     }
 
-    g->context = pa_context_new (pa_threaded_mainloop_get_api (g->mainloop),
-                                 g->conf.server);
-    if (!g->context) {
-        goto fail;
-    }
-
-    pa_context_set_state_callback (g->context, context_state_cb, g);
-
-    if (pa_context_connect (g->context, g->conf.server, 0, NULL) < 0) {
-        qpa_logerr (pa_context_errno (g->context),
-                    "pa_context_connect() failed\n");
-        goto fail;
+    if (qpa_context_connect(g)) {
+      goto fail;
     }
 
     pa_threaded_mainloop_lock (g->mainloop);
@@ -822,7 +858,7 @@ struct audio_driver pa_audio_driver = {
     .can_be_default = 1,
     .max_voices_out = INT_MAX,
     .max_voices_in  = INT_MAX,
-    .voice_size_out = sizeof (PAVoiceOut),
-    .voice_size_in  = sizeof (PAVoiceIn),
+    .voice_size_out = sizeof (PAVoice),
+    .voice_size_in  = sizeof (PAVoice),
     .ctl_caps       = VOICE_VOLUME_CAP
 };
